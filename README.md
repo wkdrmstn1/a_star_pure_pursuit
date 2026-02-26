@@ -1,4 +1,4 @@
-# 🏎️ ROS2 A* & Pure Pursuit Navigation Project
+# ROS2 A* & Pure Pursuit Navigation Project
 
 **A* 알고리즘**을 통한 전역 경로 계획 / **Pure Pursuit**을 이용한 지역 경로 추종을 학습
 LiDAR 기반의 동적 회피와 YOLOv8 기반의 객체 인식을 포함한 주행 
