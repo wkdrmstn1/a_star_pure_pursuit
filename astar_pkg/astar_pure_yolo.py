@@ -1,12 +1,23 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped
-from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid, Path
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from math import pow, atan2, sqrt, sin, cos, pi
 import heapq
 import numpy as np
+from ultralytics import YOLO
+from sensor_msgs.msg import Image 
+from cv_bridge import CvBridge
+import cv2
+
+try:
+    model = YOLO(r"yolov8n.pt")
+    print("yolov8n.pt loaded")
+    
+except Exception as e:
+    print(e)
+    exit()
 
 class NodeAStar:
     def __init__(self, parent=None, position=None):
@@ -22,22 +33,22 @@ class IntegratedNavigation(Node):
     def __init__(self):
         super().__init__('integrated_navigation')
 
-        qos_policy = QoSProfile(
+        qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
 
-        # 파라미터
-        self.lookahead_dist = 0.5  
-        self.linear_vel = 0.2      
-        self.stop_tolerance = 0.2 
+        self.lookahead_dist = 0.5  # 전방 주시 거리 
+        self.linear_vel = 0.2      # 이동 속도 
+        self.stop_tolerance = 0.15 # 도착 인정 거리 
         
-        self.obs_threshold = 0.50
-        self.left_dist = 99.9
-        self.front_dist = 99.9
-        self.right_dist = 99.9
+        # 안전거리
+        self.safety_margin = 4
+        
+        self.is_object_detected = False
+        self.target_class_id = 67           # 휴대폰 감지 
+        self.bridge = CvBridge()
 
         self.map_data = None
         self.map_resolution = 0.05
@@ -56,30 +67,34 @@ class IntegratedNavigation(Node):
         self.sub_map = self.create_subscription(OccupancyGrid, '/map', self.map_callback, 10)
         self.sub_pose = self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', self.pose_callback, 10)
         self.sub_goal = self.create_subscription(PoseStamped, '/goal_pose', self.goal_callback, 10)
-        self.sub_scan = self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
-        # , qos_profile=qos_policy
+        self.sub_cam = self.create_subscription(Image, '/camera/image_raw', self.img_callback, qos_profile)
 
+        # timer 주기 
         self.timer = self.create_timer(0.1, self.control_loop)
         self.get_logger().info("Let's Run!")
+    
+    def img_callback(self,msg):
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            results = model(cv_image, verbose=False, conf=0.5)
+            detected = False
 
-    def scan_callback(self, msg):
-        if not msg.ranges: return
-        # 장애물 바라보는 각도
-        front_ranges = msg.ranges[0:40] + msg.ranges[-40:]
-        
-        # 좌우 비교를 위한 각도 
-        left_ranges = msg.ranges[20:70]
-        right_ranges = msg.ranges[-70:-20]
+            for result in results:
+                boxes = result.boxes
 
-        self.front_dist = self.get_min_dist(front_ranges)
-        self.left_dist = self.get_min_dist(left_ranges)
-        self.right_dist = self.get_min_dist(right_ranges)
+                for box in boxes:
+                    cls_id = int(box.cls[0])
 
-    def get_min_dist(self, range_list):
-        valid_values = [x for x in range_list if x > 0.05 and x < 10.0]
-        if valid_values:
-            return min(valid_values)
-        return 99.9
+                    if cls_id == self.target_class_id:
+                        detected = True
+
+                if detected: 
+                    break
+            self.is_object_detected = detected
+
+        except Exception as e:
+            self.get_logger().info(e)
+
 
     def map_callback(self, msg):
         self.map_resolution = msg.info.resolution
@@ -111,6 +126,17 @@ class IntegratedNavigation(Node):
         else:
             self.get_logger().warn("No Path Found.")
 
+
+    def check_safety(self, y, x) :
+        margin = self.safety_margin
+
+        for r in range(y - margin, y + margin + 1):
+            for c in range(x - margin, x + margin + 1):
+                if 0 <= r < self.map_height and 0 <= c < self.map_width:
+                    if self.map_data[r][c] != 0: # 0이 아니면 장애물 
+                        return False
+        return True
+
     def run_astar(self, start, end):
         if not (0 <= start[0] < self.map_height and 0 <= start[1] < self.map_width): return None
         if not (0 <= end[0] < self.map_height and 0 <= end[1] < self.map_width): return None
@@ -140,6 +166,8 @@ class IntegratedNavigation(Node):
                 if not (0 <= ny < self.map_height and 0 <= nx < self.map_width): continue
                 if self.map_data[ny][nx] != 0: continue
                 
+                if not self.check_safety(ny, nx) : continue
+                
                 new_node = NodeAStar(current_node, (ny, nx))
                 new_node.g = current_node.g + 1
                 new_node.h = sqrt((ny - end[0])**2 + (nx - end[1])**2)
@@ -149,43 +177,36 @@ class IntegratedNavigation(Node):
 
     def control_loop(self):
 
+        if self.is_object_detected:         # 휴대폰이 감지 됐을때 정지 
+            self.stop_robot()
+            self.get_logger().warn("detected")
+            return
+
         if not self.global_path: return
 
-        final_goal = self.global_path[-1] 
+        final_goal = self.global_path[-1] # 목적지 
+        
+        # 목적지까지 거리 계산
         dist_to_final = sqrt((final_goal[0]-self.current_pose[0])**2 + (final_goal[1]-self.current_pose[1])**2)
 
         if dist_to_final < self.stop_tolerance:
             self.global_path = []
             self.stop_robot()
             return
-        
-        if self.front_dist < self.obs_threshold:
-            self.get_logger().warn(f"Obstacle Ahead! ({self.front_dist:.2f}m)")
-            
-            cmd = Twist()
-            cmd.linear.x = 0.0  
 
-            if self.left_dist > self.right_dist:
-                cmd.angular.z = 0.5 
-                self.get_logger().info("Turn Left!")
-            else:
-                cmd.angular.z = -0.5
-                self.get_logger().info("Turn Right!")
-            
-            self.pub_cmd.publish(cmd) 
-            return
-        
-
+        # 도착 지점의 좌표 
         target_x, target_y = final_goal
-        
+         
         for i in range(self.path_index, len(self.global_path)):
             px, py = self.global_path[i]
             dist = sqrt((px - self.current_pose[0])**2 + (py - self.current_pose[1])**2)
+            # 주시 거리보다 좀 멀리 목적지 설정 
             if dist >= self.lookahead_dist:
                 target_x, target_y = px, py 
                 self.path_index = i
                 break
 
+        # 갱신한 목적지까지의 거리 계산
         dx = target_x - self.current_pose[0]
         dy = target_y - self.current_pose[1]
         alpha = atan2(dy, dx) - self.current_yaw
@@ -198,7 +219,7 @@ class IntegratedNavigation(Node):
         cmd = Twist()
         cmd.linear.x = self.linear_vel
         cmd.angular.z = angular_velocity
-
+        
         if cmd.angular.z > 1.0: cmd.angular.z = 1.0
         if cmd.angular.z < -1.0: cmd.angular.z = -1.0
         
