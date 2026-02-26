@@ -29,9 +29,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'map = astar_pkg.map:main',
-            'main = astar_pkg.main:main',
+            'basic = astar_pkg.basic:main',
             'astar_pure = astar_pkg.astar_pure:main',
+            'astar_pure_yolo = astar_pkg.astar_pure_yolo:main',
         ],
     },
 )
